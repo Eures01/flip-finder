@@ -1,4 +1,4 @@
-const CACHE='flip-finder-v4-20261001b';
+const CACHE='flip-finder-v4.1-20261001a';
 const ASSETS=['/','/index.html','/manifest.webmanifest'];
 self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS)))});
 self.addEventListener('activate',e=>{e.waitUntil((async()=>{await caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k))));await self.clients.claim()})())});

@@ -12,12 +12,12 @@ function cleanText(value) {
 }
 
 async function ebayToken() {
-  const id = process.env.EBAY_CLIENT_ID;
-  const secret = process.env.EBAY_CLIENT_SECRET;
+  const id = String(process.env.EBAY_CLIENT_ID || '').trim();
+  const secret = String(process.env.EBAY_CLIENT_SECRET || '').trim();
   if (!id || !secret) return null;
   if (ebayCache.token && Date.now() < ebayCache.expires) return ebayCache.token;
 
-  const auth = Buffer.from(`${id}:${secret}`).toString('base64');
+  const auth = Buffer.from(`${id}:${secret}`, 'utf8').toString('base64');
   const body = new URLSearchParams({
     grant_type: 'client_credentials',
     scope: 'https://api.ebay.com/oauth/api_scope'
@@ -26,12 +26,22 @@ async function ebayToken() {
     method: 'POST',
     headers: {
       Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/x-www-form-urlencoded'
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json'
     },
     body
   });
-  if (!r.ok) throw new Error(`eBay token failed (${r.status})`);
-  const d = await r.json();
+  const raw = await r.text();
+  let d = {};
+  try { d = raw ? JSON.parse(raw) : {}; } catch { d = {}; }
+  if (!r.ok) {
+    const detail = cleanText(d.error_description || d.message || d.error || raw).slice(0, 180);
+    if (r.status === 401) {
+      throw new Error(`eBay Production credentials were rejected (401)${detail ? `: ${detail}` : ''}. Use the Production App ID as EBAY_CLIENT_ID and Production Cert ID as EBAY_CLIENT_SECRET; Sandbox keys will not work with api.ebay.com.`);
+    }
+    throw new Error(`eBay token failed (${r.status})${detail ? `: ${detail}` : ''}`);
+  }
+  if (!d.access_token) throw new Error('eBay token response did not include an access token.');
   ebayCache = {
     token: d.access_token,
     expires: Date.now() + Math.max(60, (d.expires_in || 7200) - 120) * 1000
@@ -95,20 +105,42 @@ async function ebaySearch({ upc = null, query = null }) {
 }
 
 async function keepaLookup(upc) {
-  const key = process.env.KEEPA_API_KEY;
+  const key = String(process.env.KEEPA_API_KEY || '').trim();
   if (!key) return null;
 
+  const code = String(upc || '').replace(/\D/g, '');
   const url = new URL('https://api.keepa.com/product');
   url.searchParams.set('key', key);
   url.searchParams.set('domain', '1');
-  url.searchParams.set('code', upc);
+  url.searchParams.set('code', code);
+  url.searchParams.set('code-limit', '5');
   url.searchParams.set('stats', '90');
+  url.searchParams.set('history', '0');
 
-  const r = await fetch(url, { headers: { 'Accept-Encoding': 'gzip' } });
-  if (!r.ok) throw new Error(`Keepa lookup failed (${r.status})`);
-  const d = await r.json();
-  const p = d.products?.[0];
-  if (!p) return null;
+  const r = await fetch(url, { headers: { Accept: 'application/json', 'Accept-Encoding': 'gzip' } });
+  const raw = await r.text();
+  let d = {};
+  try { d = raw ? JSON.parse(raw) : {}; } catch { d = {}; }
+  if (!r.ok) {
+    const detail = cleanText(d.error?.message || d.error || d.message || raw).slice(0, 220);
+    throw new Error(`Keepa lookup failed (${r.status})${detail ? `: ${detail}` : ''}`);
+  }
+  if (d.error) {
+    const detail = cleanText(d.error?.message || d.error).slice(0, 220);
+    throw new Error(`Keepa API error${detail ? `: ${detail}` : ''}`);
+  }
+  const products = Array.isArray(d.products) ? d.products : [];
+  if (!products.length) return null;
+
+  // A product code can map to multiple ASINs. Prefer a listing with a usable current price,
+  // otherwise use the first returned product.
+  const priceCandidates = [18, 0, 1, 10]; // Buy Box, Amazon, New, New FBA
+  const scoreProduct = p => {
+    const current = p?.stats?.current;
+    if (!Array.isArray(current)) return 0;
+    return priceCandidates.some(i => Number.isFinite(current[i]) && current[i] > 0) ? 1 : 0;
+  };
+  const p = [...products].sort((a, b) => scoreProduct(b) - scoreProduct(a))[0];
 
   const current = p.stats?.current;
   let price = null;
@@ -148,6 +180,7 @@ async function keepaLookup(upc) {
     features: features.slice(0, 5),
     image,
     salesRank,
+    matchedProducts: products.length,
     tokensLeft: d.tokensLeft
   };
 }
@@ -202,7 +235,7 @@ async function handleLookup(res, upc) {
         amazonPriceType: keepa.priceType,
         amazonSalesRank: keepa.salesRank
       });
-      out.sources.keepa = { asin: keepa.asin, tokensLeft: keepa.tokensLeft };
+      out.sources.keepa = { asin: keepa.asin, tokensLeft: keepa.tokensLeft, matchedProducts: keepa.matchedProducts };
       msgs.push(keepa.price
         ? `Amazon/Keepa matched this product and returned a ${keepa.priceType || 'current'} price.`
         : 'Amazon/Keepa matched the product, but no usable current price was returned.');
@@ -254,7 +287,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, {
       ebay: !!(process.env.EBAY_CLIENT_ID && process.env.EBAY_CLIENT_SECRET),
       keepa: !!process.env.KEEPA_API_KEY,
-      version: '4.0'
+      version: '4.1'
     });
   }
   if (u.pathname === '/api/lookup') {
@@ -280,4 +313,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Flip Finder v4 running at http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`Flip Finder v4.1 running at http://localhost:${PORT}`));
